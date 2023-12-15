@@ -1,0 +1,179 @@
+import datetime
+import json
+import sys
+import os.path
+import requests
+import inspect
+import pprint
+import session_vars
+from genquery import Query, AS_DICT
+
+
+def writeStringToCharArray(s, char_array):
+    for i in range(0, len(s)):
+        char_array[i] = s[i]
+
+
+myself = lambda: inspect.stack()[1][3]
+
+
+def log_delimiter(callback, msg):
+    pattern = '=================================='
+    callback.writeLine("serverLog", "{0} {1} {0}".format(pattern, msg))
+
+
+def log_divider(callback, msg):
+    pattern = '----------------------------------'
+    callback.writeLine("serverLog", "{0} {1} {0}".format(pattern, msg))
+
+
+def log_context(rule_args, callback, rei):
+    callback.writeLine("serverLog", "sys.executable = [{}]".format(sys.executable))
+    callback.writeLine("serverLog", "sys.path = [{}]".format(sys.path))
+    callback.writeLine("serverLog", "rule_args = [{}]".format(rule_args))
+    callback.writeLine("serverLog", "callback = [{}]".format(callback))
+    callback.writeLine("serverLog", "rei = [{}]".format(rei))
+
+
+def log_contents(callback, obj, name):
+    log_divider(callback, name)
+    attrs = dir(obj)
+    callback.writeLine("serverLog", "dir({}) = [{}]".format(name, attrs))
+    for attr in attrs:
+        if not attr.startswith("__"):
+            callback.writeLine("serverLog", "{} = [{}]".format(attr, getattr(obj,attr)))
+
+
+def dump_guts(rule_args, callback, rei):
+    log_context(rule_args, callback, rei)
+    log_contents(callback, callback, "callback")
+    log_contents(callback, rei, "rei")
+    log_contents(callback, rei.doi, "rei.doi")
+    log_contents(callback, rei.rsComm, "rei.rsComm")
+    Map = session_vars.get_map(rei)
+    log_divider(callback, "Map")
+    callback.writeLine("serverLog", "\n" + pprint.pformat(Map, indent=4))    
+    Kvp = { str(a):str(b) for a,b in Map["key_value_pairs"].items() }
+    log_divider(callback, 'Kvp')
+    callback.writeLine("serverLog", "\n" + pprint.pformat(Kvp, indent=4))    
+
+
+def pythonRuleEnginePluginTest(rule_args, callback, rei):
+    log_delimiter(callback, "Begin " + myself())
+    dump_guts(rule_args, callback, rei)
+    log_delimiter(callback, "End " + myself())
+
+
+def delayedDataDelete(rule_args, callback, rei):
+    """
+    The implementation of acDataDeletePolicy on the delay queue.
+
+    BOOST places the list of string arguments to this rule function
+    into rule_args. The BOOST "framework" supplies new callback and rei
+    instances. 
+
+    This implementation requires:
+
+        "maximum_number_of_concurrent_rule_engine_server_processes": 1
+
+    in the iRODS 4.2 advanced_settings stanza of server_config.json
+    until rule locking can be implemented. This does not affect
+    non-delayed rules.
+
+    This setting becomes "number_of_concurrent_delay_rule_executors"
+    in iRODS 4.3.
+    """
+
+    log_delimiter(callback, "Begin " + myself())
+    objPath, dataSize, hsUserName = rule_args
+    callback.writeLine("serverLog", "objPath = [{}]".format(objPath))
+    callback.writeLine("serverLog", "dataSize = [{}]".format(dataSize))
+    callback.writeLine("serverLog", "hsUserName = [{}]".format(hsUserName))
+
+    # EXCLUDE DATA OBJECTS PERTAINING TO FAIR METADATA.
+    #     Chop the data object path into the subcollection names.
+    #     Continue with rule if the data object path is deep enough. 
+    hsColParts = os.path.normpath(objPath).split(os.path.sep)
+    callback.writeLine("serverLog", "hsColParts = [{}]".format(hsColParts))
+    if len(hsColParts) > 7:
+        # WHAT IS THE CURRENT USAGE IN THIS ZONE FOR THE HYDROSHARE USER?
+        #     This comes from an AVU on the bags collection for the zone's proxy user.
+        #        Form the AVU attribute name from the Hydroshare user name.
+        #        Form the bags path from the first three subcollection names.
+        #        Look for the value of the attribute on the bags collection.
+        hsQuotaName = hsUserName + "-usage"
+        hsQuotaColParts = hsColParts[1:4] + ['bags']
+        hsQuotaColPath = os.path.join(os.path.sep, *hsQuotaColParts)
+        callback.writeLine("serverLog", "hsQuotaColPath = [{}]".format(hsQuotaColPath))
+        rows = list(Query(callback,
+                          ["META_COLL_ATTR_VALUE",],
+                          "COLL_NAME = '{}' and META_COLL_ATTR_NAME = '{}'".format(hsQuotaColPath, hsQuotaName),
+                          AS_DICT, 0, 2))
+        callback.writeLine("serverLog", "len(rows) = [{}]".format(len(rows)))
+        if rows:
+            hsUsage = long(rows[0]["META_COLL_ATTR_VALUE"])
+            callback.writeLine("serverLog", "hsUsage before decrement = [{}]".format(hsUsage))
+
+            # DECREMENT THE OWNER'S USAGE.
+            #     Compute the new usage by subtracting the data object size from the current usage.
+            #     Overwrite the user's usage AVU on the bags collection.
+            hsUsage -= long(dataSize)
+            callback.writeLine("serverLog", "hsUsage after decrement = [{}]".format(hsUsage))
+            status = callback.msiModAVUMetadata('-C', hsQuotaColPath, 'set', hsQuotaName, str(hsUsage), '')
+            callback.writeLine("serverLog", "msiModAVUMetadata status = [{}]".format(status))
+
+            # Call the Hydroshare ReST API to aggregate the user's total quota across all zones in the Django db.
+            #     Form the URI from the Hydroshare user's name.
+            #     POST the URI.
+            #     Throw away HTTP status code LOL.
+            hsRestUser = "dummy"
+            hsRestPwd = "dummy"
+            hsRestUrl = "https://dummy.org/dummy/dummy/dummy/{}/".format(hsUserName)
+            r = requests.post(hsRestUrl, auth=(hsRestUser, hsRestPwd), data={})
+            callback.writeLine("serverLog", "Hydroshare Rest Status = [{}]".format(str(r.status_code)))
+        else:
+            callback.writeLine("serverLog", "Quota usage not found for [{}]".format(hsUserName))
+    else:
+        callback.writeLine("serverLog", "Skipping [{}]".format(objPath))
+    log_delimiter(callback, "End " + myself())
+
+
+def acDataDeletePolicy(rule_args, callback, rei):
+    log_delimiter(callback, "Begin " + myself())
+    # dump_guts(rule_args, callback, rei, myself())
+    objPath = str(rei.doi.objPath)
+    dataSize = str(rei.doi.dataSize)
+    callback.writeLine("serverLog", "objPath = [{}]".format(objPath))
+    callback.writeLine("serverLog", "dataSize = [{}]".format(dataSize))
+    
+    # EXCLUDE DATA OBJECTS PERTAINING TO FAIR METADATA.
+    #     Chop the data object path into the subcollection names.
+    #     Continue with rule if the data object path is deep enough.
+    hsColParts = os.path.normpath(objPath).split(os.path.sep)
+    callback.writeLine("serverLog", "hsColParts = [{}]".format(hsColParts))
+    if len(hsColParts) > 7:
+        # WHAT HYDROSHARE USER OWNS THIS DATA OBJECT?
+        #     This comes from an AVU on the HS resource collection, which will be deleted prior
+        #     to the delayed rule, and thus must be computed and passed to the delay rule via
+        #     the BOOST-constructed rule_args parameter.
+        #         Use the first four subcollection names to form the HS resource collection path.
+        #         Look for the value of the attribute called quotaUserName on the HS resource collection.
+        hsColPath = os.path.join(os.path.sep, *hsColParts[1:5])
+        callback.writeLine("serverLog", "hsColPath = [{}]".format(hsColPath))
+        rows = list(Query(callback,
+                          ["META_COLL_ATTR_VALUE",],
+                          "COLL_NAME = '{}' and META_COLL_ATTR_NAME = 'quotaUserName'".format(hsColPath),
+                          AS_DICT, 0, 2))
+        callback.writeLine("serverLog", "len(rows) = [{}]".format(len(rows)))
+        if rows:
+            hsUserName = rows[0]["META_COLL_ATTR_VALUE"]
+            callback.writeLine("serverLog", "hsUserName = [{}]".format(hsUserName))
+            callback.delayExec (("<PLUSET>1s</PLUSET>" +
+                                 "<INST_NAME>irods_rule_engine_plugin-python-instance</INST_NAME>"),
+                                "callback.delayedDataDelete('{}', '{}', '{}')".format(objPath, dataSize, hsUserName),
+                                "")
+        else:
+            callback.writeLine("serverLog", "Hydroshare quota owner not found for [{}]".format(objPath))
+    else:
+        callback.writeLine("serverLog", "Skipping [{}]".format(objPath))
+    log_delimiter(callback, "End " + myself())
